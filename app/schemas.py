@@ -8,10 +8,14 @@ semantic_validation so the whole request is rejected with explicit codes:
 * ``freq_low`` may not exceed ``freq_high`` (equal is allowed, a single
   frequency);
 * ``start_time`` must be strictly earlier than ``end_time``.
+
+The batch approval additionally requires a non-empty list of positive
+application IDs; the duplicate-ID rule is enforced in the endpoint.
 """
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Annotated
 
 from pydantic import BaseModel, Field
 
@@ -43,6 +47,15 @@ class ApplicationCreate(BaseModel):
 class ApprovalRequest(BaseModel):
     # Revision the client based its preview decision on; required.
     expected_revision: int = Field(ge=0)
+
+
+class BatchApprovalRequest(BaseModel):
+    # Revision the operator based the group decision on; required.
+    expected_revision: int = Field(ge=0)
+    # Non-empty list of pending application IDs, approved in list order.
+    # Duplicates are rejected structurally (see the batch endpoint for the
+    # whole-request 422 envelope).
+    application_ids: list[Annotated[int, Field(ge=1)]] = Field(min_length=1)
 
 
 class RevocationRequest(BaseModel):

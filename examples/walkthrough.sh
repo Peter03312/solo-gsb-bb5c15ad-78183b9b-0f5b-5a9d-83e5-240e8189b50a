@@ -57,6 +57,46 @@ post "/api/applications/$A_ID/revoke" '{"reason":"postponed"}' | J
 echo "== 9. approve B at revision 2 =="
 post "/api/applications/$B_ID/approve" '{"expected_revision":2}' | J
 
+echo "== 9b. submit two more non-conflicting devices (far away, guard-band safe) =="
+C=$(post /api/applications '{
+  "name":"Stage C",
+  "circle":{"cx":5000,"cy":5000,"radius":10},
+  "frequency":{"low":300,"high":310},
+  "time_window":{"start":"2026-10-01T09:00:00Z","end":"2026-10-01T11:00:00Z"}
+}')
+C_ID=$(echo "$C" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+D=$(post /api/applications '{
+  "name":"Stage D",
+  "circle":{"cx":5000,"cy":5000,"radius":10},
+  "frequency":{"low":400,"high":410},
+  "time_window":{"start":"2026-10-01T09:00:00Z","end":"2026-10-01T11:00:00Z"}
+}')
+D_ID=$(echo "$D" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+# E stays pending: used below to demonstrate the stale-revision rejection.
+E=$(post /api/applications '{
+  "name":"Stage E",
+  "circle":{"cx":5000,"cy":5000,"radius":10},
+  "frequency":{"low":500,"high":510},
+  "time_window":{"start":"2026-10-01T09:00:00Z","end":"2026-10-01T11:00:00Z"}
+}')
+E_ID=$(echo "$E" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+echo "== 9c. batch-approve [$C_ID,$D_ID] at revision 3 (atomic, revisions 4 and 5) =="
+post /api/applications/batch-approve \
+  "{\"expected_revision\":3,\"application_ids\":[$C_ID,$D_ID]}" | J
+
+echo "== 9d. batch rejections: duplicate id (422) and stale revision (409) =="
+post /api/applications/batch-approve \
+  "{\"expected_revision\":5,\"application_ids\":[$C_ID,$C_ID]}" | J || true
+post /api/applications/batch-approve \
+  "{\"expected_revision\":3,\"application_ids\":[$E_ID]}" | J || true
+
+echo "== 9e. as-of revision 4 restores the batch prefix [B, C] =="
+curl -s "$BASE/api/revision/4" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("revision:", d["revision"], "effective:", d["effective_application_ids"])'
+
 echo "== 10. history snapshots =="
 curl -s "$BASE/api/revision/1" | J
 curl -s "$BASE/api/revision/2" | J
