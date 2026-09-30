@@ -45,5 +45,14 @@ class ApprovalRequest(BaseModel):
     expected_revision: int = Field(ge=0)
 
 
+class BatchApprovalRequest(BaseModel):
+    # Group approval is conditional on one shared expected revision, exactly
+    # like the single-item endpoint.
+    expected_revision: int = Field(ge=0)
+    # Decided strictly in the given order; non-empty / no duplicates are
+    # enforced as whole-request semantic rules (see semantic_validation).
+    application_ids: list[int]
+
+
 class RevocationRequest(BaseModel):
     reason: str = Field(default="", max_length=2000)

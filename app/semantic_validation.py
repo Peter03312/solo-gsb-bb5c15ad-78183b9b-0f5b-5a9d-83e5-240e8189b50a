@@ -14,6 +14,9 @@ FREQUENCY_LOW_ABOVE_HIGH = "frequency_low_above_high"
 TIME_START_NOT_BEFORE_END = "time_start_not_before_end"
 VALUE_NOT_FINITE = "value_not_finite"
 NAIVE_DATETIME = "naive_datetime"
+BATCH_EMPTY = "application_ids_empty"
+BATCH_DUPLICATE = "application_ids_not_unique"
+
 
 
 def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
@@ -71,6 +74,41 @@ def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
                 "field": "time_window.start",
                 "code": TIME_START_NOT_BEFORE_END,
                 "message": "time_window start must be strictly earlier than end",
+            }
+        )
+
+    return errors
+
+
+def validate_batch_application_ids(application_ids: list[int]) -> list[dict[str, str]]:
+    """Whole-request rules for a group approval.
+
+    The list must be non-empty and contain no duplicates (existence/status of
+    each id are transactional checks performed under the revision lock).
+    """
+    errors: list[dict[str, str]] = []
+    if not application_ids:
+        errors.append(
+            {
+                "field": "application_ids",
+                "code": BATCH_EMPTY,
+                "message": "application_ids must contain at least one id",
+            }
+        )
+
+    seen: set[int] = set()
+    duplicates: list[int] = []
+    for app_id in application_ids:
+        if app_id in seen and app_id not in duplicates:
+            duplicates.append(app_id)
+        seen.add(app_id)
+    for app_id in duplicates:
+        errors.append(
+            {
+                "field": "application_ids",
+                "code": BATCH_DUPLICATE,
+                "message": f"application id {app_id} appears more than once",
+                "application_id": app_id,
             }
         )
 

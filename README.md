@@ -8,7 +8,11 @@
 - 干扰裁决：两项**有效**批准仅在 **时段相交 且 覆盖区域相交**，并且 **频段相交或最短频率间隔小于非负保护带宽** 时构成干扰
 - 乐观修订号控制并发：预览返回当前修订号，批准必须携带该号并重新裁决；
   修订号过期或与并发批准相撞，均**不得占用频段**并返回原因
+- **整组批准**：运营人员可携带一个预期修订号和非空、无重复的申请 ID 列表
+  一次性批准整场活动的多台设备；同一事务内对**当前有效许可与组内申请**统一
+  裁决，任一失败则整组不批准、修订号不变；全部通过则按输入顺序写入连续修订号
 - 撤销只改变后续裁决所用的**有效集合**；按修订号查询可还原当时全部批准、撤销记录
+  （整组批准产生的每个修订号都可查询，还原该设备获批那一刻的有效集合）
 
 ---
 
@@ -55,7 +59,7 @@ export GUARD_BAND="2.0"
 uvicorn app.main:app --reload
 ```
 
-运行测试（自动使用临时 SQLite 库，共 30 个用例）：
+运行测试（自动使用临时 SQLite 库，共 51 个用例）：
 
 ```bash
 pip install -r requirements-dev.txt
@@ -118,13 +122,24 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 
 ### 修订号与并发模型
 
-- 初始修订号为 **0**；每次批准或撤销都使修订号 +1，并追加一条不可变事件。
+- 初始修订号为 **0**；每次批准、**整组批准中的每项**或撤销都使修订号 +1，
+  并追加一条不可变事件。
 - `POST .../preview` 返回 `current_revision`、冲突对象及每个触发条件。
 - `POST .../approve` 必须携带 `expected_revision`。服务在 PostgreSQL
   单行修订号表上 `SELECT ... FOR UPDATE` 串行化所有批准/撤销事务：
   - `expected_revision != 当前修订号` → **409 `stale_revision`**（修订过期/被并发抢先）；
   - 号对但锁内**重新裁决**发现冲突 → **409 `interference`**（不得占用频段，响应体附冲突）；
   - 通过 → 写入批准事件，占用新修订号。
+- `POST .../batch-approve` 整组批准与单笔批准、撤销共享**同一把行锁与修订裁决**：
+  - 锁内按输入顺序核对每项：ID 是否存在、是否仍为 `pending`，并对
+    **当前有效许可**及**组内更早的申请**统一执行干扰规则（即使更早的组员
+    自身也失败，仍参与后续成对裁决，确保一次性返回全部冲突）；
+  - 任一项失败（ID 无效 / 状态不符 / 修订过期 / 任一干扰）→ 整组不批准、
+    **修订号不变、无部分获批**，返回 **409 `batch_rejected`**，
+    `details` 按失败类型分组列出具体申请（含 `batch_index`）与冲突对象；
+  - 全部通过 → **一次提交**，按输入顺序为每项写入批准事件和**连续修订号**
+    （`from_revision+1 … revision`）；按其中**任一修订号**查询即还原截至
+    该项获批的有效集合（见 6.12）。
 - `POST .../revoke` 只把申请移出有效集合（产生新修订号），历史不删除。
 - `GET /api/revision/{n}` 还原修订号 **n 当时**的批准与撤销记录
   （`n` 超过当前修订号返回 404）。
@@ -140,6 +155,7 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 | `GET` | `/api/applications/{id}` | 查看单笔申请 |
 | `POST` | `/api/applications/{id}/preview` | 冲突预览（返回冲突对象、触发条件、当前修订号） |
 | `POST` | `/api/applications/{id}/approve` | 携带修订号批准（锁内重新裁决） |
+| `POST` | `/api/applications/batch-approve` | **整组批准**：一个修订号 + 非空无重复 ID 列表，全有或全无 |
 | `POST` | `/api/applications/{id}/revoke` | 撤销（仅影响后续有效集合） |
 | `GET` | `/api/revision/current` | 当前修订号 + 有效集合 + 全部事件 |
 | `GET` | `/api/revision/{revision}` | 按修订号还原当时的批准/撤销记录 |
@@ -153,13 +169,14 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 
 | HTTP | `error.code` | 触发场景 |
 | --- | --- | --- |
-| 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例） |
+| 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例）；整组请求的空列表 `application_ids_empty`、重复 ID `application_ids_not_unique` 亦在此 |
 | 404 | `not_found` | 申请不存在 |
 | 404 | `revision_out_of_range` | 查询了未来修订号 |
 | 409 | `not_pending` | 批准已处理申请 / 撤销待审批申请 |
 | 409 | `already_revoked` | 重复撤销 |
 | 409 | `stale_revision` | 修订号过期或被并发批准抢占 |
 | 409 | `interference` | 重新裁决发现干扰，频段未占用 |
+| 409 | `batch_rejected` | 整组批准任一失败：修订过期 / ID 无效 / 状态不符 / 组内外干扰，整组不批准且修订号不变 |
 
 ---
 
@@ -336,6 +353,94 @@ curl -s http://localhost:8000/api/revision/999
 脚本版走查：[`examples/walkthrough.sh`](examples/walkthrough.sh)
 （`./examples/walkthrough.sh http://localhost:8000`）。
 
+### 6.12 整组批准（多台设备一次裁决）
+
+一场活动的多台设备分别提交申请后，运营人员调用 `batch-approve`，携带
+**一个** `expected_revision` 与按申请顺序排列的 ID 列表。下例的三个频段
+彼此间隔 3 MHz（> 2 MHz 保护带宽），同地同时段也不构成干扰：
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/batch-approve \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 0, "application_ids": [1, 2, 3]}'
+```
+
+成功时整组**一次提交**，按输入顺序占用连续修订号（上例假设当前为修订号 0，
+即占用 1、2、3）：
+
+```json
+{
+  "approved": true,
+  "expected_revision": 0,
+  "from_revision": 0,
+  "revision": 3,
+  "revisions": [1, 2, 3],
+  "count": 3,
+  "guard_band": 2.0,
+  "results": [
+    {"application_id": 1, "revision": 1, "application": {"id": 1, "status": "approved", "approval_revision": 1, ...}},
+    {"application_id": 2, "revision": 2, "application": {"id": 2, "status": "approved", "approval_revision": 2, ...}},
+    {"application_id": 3, "revision": 3, "application": {"id": 3, "status": "approved", "approval_revision": 3, ...}}
+  ]
+}
+```
+
+按其中**任一修订号**查询，还原的是**截至该项获批**的有效集合（前缀）：
+
+```bash
+curl -s http://localhost:8000/api/revision/2
+# {"revision": 2, "effective_application_ids": [1, 2],
+#  "approvals": [{"revision": 1, ...}, {"revision": 2, ...}], "revocations": []}
+```
+
+任一检查失败时，整组不批准、**修订号不变、没有任何一项获批**，HTTP 409
+`batch_rejected`，`details` 按失败类型分组（仅出现实际发生的类型；每条都带
+其在输入列表中的 `batch_index`，冲突对象额外标注 `scope`：
+`effective` = 当前有效许可，`batch` = 组内更早的申请并附 `batch_index`）：
+
+```bash
+# id 4 与有效许可冲突、id 99999 不存在、且修订号已过期 -> 一次返回全部原因
+curl -i -X POST http://localhost:8000/api/applications/batch-approve \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 0, "application_ids": [4, 99999]}'
+```
+
+```json
+HTTP/1.1 409 Conflict
+{"error": {"code": "batch_rejected",
+  "message": "the whole batch was not approved (stale_revision, not_found, interference); no revision was consumed",
+  "details": {
+    "expected_revision": 0, "current_revision": 3, "revised": false,
+    "stale_revision": {"expected_revision": 0, "current_revision": 3},
+    "applications_not_found": [{"application_id": 99999, "batch_index": 1}],
+    "interference": [
+      {"application_id": 4, "batch_index": 0,
+       "conflicts": [
+         {"scope": "effective", "application": {"id": 2, ...},
+          "trigger": {...}, "reason": "frequency_intersection"}]}]
+  }}}
+```
+
+`details` 可能出现的分组键：`stale_revision`、`applications_not_found`
+（ID 无效）、`applications_not_pending`（已批准/已撤销，附当前 `status`）、
+`interference`（每项含其全部冲突对象，`scope` 区分有效许可与组内申请）。
+
+请求本身畸形（空列表 / 重复 ID）属于整笔 422 `validation_failed`：
+
+```json
+{"error": {"code": "validation_failed",
+  "details": [{"field": "application_ids", "code": "application_ids_not_unique",
+               "message": "application id 1 appears more than once",
+               "application_id": 1}]}}
+```
+
+整组批准与单笔批准、撤销在 PostgreSQL 上共享同一行锁：并发的三类事务
+**串行裁决**，绝不会出现部分获批或相互干扰的有效许可——抢占失败的一方收到
+`stale_revision`（极端情况下由唯一约束兜底），重新预览/整组决定后重试即可。
+
+脚本版走查：[`examples/batch_walkthrough.sh`](examples/batch_walkthrough.sh)
+（`./examples/batch_walkthrough.sh http://localhost:8000`）。
+
 ---
 
 ## 7. 项目结构
@@ -352,7 +457,11 @@ curl -s http://localhost:8000/api/revision/999
 │   ├── config.py               # 环境变量配置
 │   └── errors.py               # 统一错误信封
 ├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite）
-├── examples/walkthrough.sh     # curl 走查脚本
+│   ├── test_adjudication.py
+│   ├── test_api.py             # 单笔提交/预览/批准/撤销/历史
+│   └── test_batch_approve.py   # 整组批准、组内冲突、并发裁决
+├── examples/walkthrough.sh     # curl 走查脚本（单笔）
+├── examples/batch_walkthrough.sh # curl 走查脚本（整组批准）
 ├── Dockerfile
 ├── docker-compose.yml          # db + api 一键启动
 ├── requirements.txt / requirements-dev.txt

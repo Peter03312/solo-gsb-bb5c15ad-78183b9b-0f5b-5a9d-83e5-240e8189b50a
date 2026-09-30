@@ -2,22 +2,26 @@
 
 Endpoints
 ---------
-POST   /api/applications                 submit (whole-request validation)
-GET    /api/applications                 list submissions
-GET    /api/applications/{id}            fetch one submission
-POST   /api/applications/{id}/preview    conflicts + current revision
-POST   /api/applications/{id}/approve    conditional approval (expected rev.)
-POST   /api/applications/{id}/revoke     revoke (changes future effective set)
-GET    /api/revision/current             current revision + effective set
-GET    /api/revision/{revision}          as-of snapshot (approvals/revocations)
-GET    /health                           liveness probe
+POST   /api/applications                          submit (whole-request validation)
+GET    /api/applications                          list submissions
+GET    /api/applications/{id}                    fetch one submission
+POST   /api/applications/{id}/preview            conflicts + current revision
+POST   /api/applications/{id}/approve            conditional approval (expected rev.)
+POST   /api/applications/batch-approve           conditional whole-group approval
+POST   /api/applications/{id}/revoke             revoke (changes future effective set)
+GET    /api/revision/current                     current revision + effective set
+GET    /api/revision/{revision}                  as-of snapshot (approvals/revocations)
+GET    /health                                   liveness probe
 
 Concurrency
 -----------
-Approval locks the singleton ``revision_meta`` row (``SELECT ... FOR UPDATE``)
-for the duration of the transaction.  Concurrent approvals therefore
-serialise: the loser re-adjudicates against the winner's commit and is
-refused with ``stale_revision`` or ``interference``.
+Every mutation (single approval, group approval and revocation) locks the
+singleton ``revision_meta`` row (``SELECT ... FOR UPDATE``) for the duration
+of the transaction.  The three operations therefore share one revision
+adjudication and serialise: a group approval either commits all its approval
+events at once with consecutive revisions or commits nothing, and a loser
+transaction is refused with ``stale_revision`` / ``interference`` (or the
+group-level ``batch_rejected`` envelope carrying every failure category).
 """
 from __future__ import annotations
 
@@ -45,9 +49,10 @@ from .models import (
 from .schemas import (
     ApplicationCreate,
     ApprovalRequest,
+    BatchApprovalRequest,
     RevocationRequest,
 )
-from .semantic_validation import validate_application
+from .semantic_validation import validate_application, validate_batch_application_ids
 
 log = logging.getLogger("radio.api")
 
@@ -59,6 +64,8 @@ E_ALREADY_REVOKED = "already_revoked"
 E_REVISION_OUT_OF_RANGE = "revision_out_of_range"
 E_STALE_REVISION = "stale_revision"
 E_INTERFERENCE = "interference"
+# Whole-group refusal; details carries per-failure-category application lists.
+E_BATCH_REJECTED = "batch_rejected"
 
 
 # --------------------------------------------------------------------------- #
@@ -116,6 +123,22 @@ def serialize_conflict(conflict: Conflict) -> dict[str, Any]:
         },
         "reason": conflict.reason,
     }
+
+
+def serialize_batch_conflict(
+    conflict: Conflict, scope: str, peer_index: int | None = None
+) -> dict[str, Any]:
+    """A conflict found during a group adjudication.
+
+    ``scope`` identifies the other side: ``"effective"`` for a currently
+    effective license, ``"batch"`` for an earlier application in the same
+    request (whose 0-based input position is ``peer_index``).
+    """
+    result = serialize_conflict(conflict)
+    result["scope"] = scope
+    if scope == "batch":
+        result["batch_index"] = peer_index
+    return result
 
 
 def to_license(app: Application) -> License:
@@ -499,6 +522,189 @@ def approve_application(
                 E_STALE_REVISION,
                 f"the revision advanced concurrently (now {latest}); "
                 "re-preview and re-decide",
+                status_code=409,
+                details={"current_revision": latest},
+            )
+    return response
+
+
+# --------------------------------------------------------------------------- #
+# Group approval (all-or-nothing, consecutive revisions, one shared lock)
+# --------------------------------------------------------------------------- #
+@app.post("/api/applications/batch-approve", tags=["applications"])
+def approve_applications_batch(
+    payload: BatchApprovalRequest,
+) -> dict[str, Any]:
+    semantic_errors = validate_batch_application_ids(payload.application_ids)
+    if semantic_errors:
+        raise APIError(
+            E_VALIDATION,
+            "the whole batch request was rejected due to invalid application_ids",
+            status_code=422,
+            details=semantic_errors,
+        )
+
+    with SessionLocal() as session:
+        try:
+            with session.begin():
+                # Same singleton lock as single approve/revoke: all mutators
+                # share one revision adjudication and fully serialise.
+                meta = session.get(RevisionMeta, 1, with_for_update=True)
+                current = meta.revision
+
+                # Load every referenced application in input order. Unknown
+                # ids, wrong statuses and conflicts are all collected so the
+                # operator gets the complete failure picture in one response.
+                rows: list[Application | None] = [
+                    session.get(Application, app_id)
+                    for app_id in payload.application_ids
+                ]
+
+                missing: list[dict[str, Any]] = []
+                not_pending: list[dict[str, Any]] = []
+                interference: list[dict[str, Any]] = []
+
+                for index, (app_id, row) in enumerate(
+                    zip(payload.application_ids, rows)
+                ):
+                    if row is None:
+                        missing.append(
+                            {"application_id": app_id, "batch_index": index}
+                        )
+                        continue
+                    if row.status != "pending":
+                        entry: dict[str, Any] = {
+                            "application_id": app_id,
+                            "batch_index": index,
+                            "status": row.status,
+                        }
+                        if row.approval_revision is not None:
+                            entry["approval_revision"] = row.approval_revision
+                        not_pending.append(entry)
+
+                # Adjudicate in input order: every still-pending candidate is
+                # checked against (a) the effective set and (b) ALL earlier
+                # members of THIS batch (an earlier member that itself fails
+                # still participates, so the operator sees every pairwise
+                # conflict). Nothing here is committed when the group fails.
+                granted_licenses: list[License] = []
+                effective = load_effective_licenses(session)
+                id_to_index = {
+                    app_id: i for i, app_id in enumerate(payload.application_ids)
+                }
+                for index, row in enumerate(rows):
+                    if row is None or row.status != "pending":
+                        continue
+                    candidate = to_license(row)
+
+                    effective_conflicts = adjudication.evaluate(
+                        candidate, effective, settings.guard_band
+                    )
+                    peer_conflicts = adjudication.evaluate(
+                        candidate, granted_licenses, settings.guard_band
+                    )
+
+                    if effective_conflicts or peer_conflicts:
+                        interference.append(
+                            {
+                                "application_id": row.id,
+                                "batch_index": index,
+                                "conflicts": [
+                                    serialize_batch_conflict(c, "effective")
+                                    for c in effective_conflicts
+                                ]
+                                + [
+                                    serialize_batch_conflict(
+                                        c,
+                                        "batch",
+                                        peer_index=id_to_index[
+                                            c.other.application_id
+                                        ],
+                                    )
+                                    for c in peer_conflicts
+                                ],
+                            }
+                        )
+                    # Earlier members participate in later checks even when
+                    # they themselves conflict (the group is rejected anyway;
+                    # the report stays pairwise complete).
+                    granted_licenses.append(candidate)
+
+                stale = payload.expected_revision != current
+                if missing or not_pending or interference or stale:
+                    details: dict[str, Any] = {
+                        "expected_revision": payload.expected_revision,
+                        "current_revision": current,
+                        "revised": False,
+                    }
+                    categories: list[str] = []
+                    if stale:
+                        details["stale_revision"] = {
+                            "expected_revision": payload.expected_revision,
+                            "current_revision": current,
+                        }
+                        categories.append("stale_revision")
+                    if missing:
+                        details["applications_not_found"] = missing
+                        categories.append("not_found")
+                    if not_pending:
+                        details["applications_not_pending"] = not_pending
+                        categories.append("not_pending")
+                    if interference:
+                        details["interference"] = interference
+                        categories.append("interference")
+
+                    raise APIError(
+                        E_BATCH_REJECTED,
+                        "the whole batch was not approved "
+                        f"({', '.join(categories)}); no revision was consumed",
+                        status_code=409,
+                        details=details,
+                    )
+
+                # All checks passed: commit the group atomically, writing one
+                # approval event per item with consecutive revisions in the
+                # exact input order.
+                results: list[dict[str, Any]] = []
+                for row in rows:
+                    assert row is not None  # missing ids were rejected above
+                    meta.revision = current + 1 + len(results)
+                    session.add(
+                        ApprovalEvent(
+                            revision=meta.revision,
+                            application_id=row.id,
+                            guard_band=settings.guard_band,
+                        )
+                    )
+                    row.status = "approved"
+                    row.approval_revision = meta.revision
+                    results.append(
+                        {
+                            "application_id": row.id,
+                            "revision": meta.revision,
+                            "application": serialize_application(row),
+                        }
+                    )
+                session.flush()
+                response = {
+                    "approved": True,
+                    "expected_revision": payload.expected_revision,
+                    "from_revision": current,
+                    "revision": meta.revision,
+                    "revisions": [item["revision"] for item in results],
+                    "count": len(results),
+                    "guard_band": settings.guard_band,
+                    "results": results,
+                }
+        except IntegrityError:
+            # Last line of defence (e.g. backends without row locks such as
+            # SQLite's tests): a revision slot was taken concurrently.
+            session.rollback()
+            latest = session.get(RevisionMeta, 1).revision
+            raise APIError(
+                E_STALE_REVISION,
+                f"the revision advanced concurrently (now {latest}); "
+                "re-preview and re-decide the batch",
                 status_code=409,
                 details={"current_revision": latest},
             )
