@@ -1,0 +1,34 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: radio
+      POSTGRES_PASSWORD: radio
+      POSTGRES_DB: radio
+    ports:
+      - "5432:5432"
+    volumes:
+      - radio_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U radio -d radio"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://radio:radio@db:5432/radio
+      # Non-negative protection bandwidth; same unit as frequency numbers.
+      # The examples in the README use MHz, so this is 2 MHz.
+      GUARD_BAND: "2.0"
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8000"
+    ports:
+      - "8000:8000"
+
+volumes:
+  radio_pgdata:
